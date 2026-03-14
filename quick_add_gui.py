@@ -9,8 +9,10 @@ import subprocess
 import sys
 import re
 import time
+import os
 from ctypes import c_void_p
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any
 
 from PyQt6.QtCore import (
@@ -111,6 +113,51 @@ TASK_CHECKED_VISUAL = "✅ "
 TASK_UNCHECKED_PREFIXES = ("☐ ", "☐\ufe0e ", "⬜ ", "⬜️ ")
 TASK_CHECKED_PREFIXES = ("☑ ", "☑\ufe0e ", "☑️ ", "✅ ")
 TASK_MARKDOWN_PREFIXES = ("- [ ] ", "- [x] ", "- [X] ")
+MACOS_ACTIVATION_POLICY_ACCESSORY = 1
+PATH_FALLBACK_DIRS = [
+    "/opt/homebrew/bin",
+    "/usr/local/bin",
+    str(Path.home() / ".local" / "bin"),
+    str(Path.home() / "bin"),
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+]
+
+
+def _merge_path_lists(*paths: str) -> str:
+    merged: list[str] = []
+    for path_value in paths:
+        for item in path_value.split(":"):
+            item = item.strip()
+            if not item:
+                continue
+            if item not in merged:
+                merged.append(item)
+    return ":".join(merged)
+
+
+def build_runtime_path() -> str:
+    current_path = os.environ.get("PATH", "")
+    fallback_path = ":".join(PATH_FALLBACK_DIRS)
+
+    shell_path = ""
+    shell_program = os.environ.get("SHELL") or "/bin/zsh"
+    try:
+        result = subprocess.run(
+            [shell_program, "-lc", "printf %s \"$PATH\""],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1.8,
+        )
+        if result.returncode == 0:
+            shell_path = result.stdout.strip()
+    except Exception:
+        shell_path = ""
+
+    return _merge_path_lists(current_path, fallback_path, shell_path)
 
 
 def build_app_icon() -> QIcon:
@@ -119,14 +166,37 @@ def build_app_icon() -> QIcon:
 
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-    painter.setBrush(QColor("#1f5f2e"))
     painter.setPen(Qt.PenStyle.NoPen)
-    painter.drawRoundedRect(6, 6, 52, 52, 14, 14)
+    painter.setBrush(QColor("#1f2933"))
+    painter.drawRoundedRect(4, 4, 56, 56, 14, 14)
 
-    painter.setPen(QColor("white"))
-    painter.setFont(QFont("Sans Serif", 28, QFont.Weight.Bold))
-    painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "+")
+    shard = [
+        QPointF(23, 12),
+        QPointF(39, 14),
+        QPointF(46, 26),
+        QPointF(41, 44),
+        QPointF(24, 50),
+        QPointF(16, 38),
+        QPointF(18, 22),
+    ]
+    painter.setBrush(QColor("#7c3aed"))
+    painter.drawPolygon(shard)
+
+    painter.setBrush(QColor("#111827"))
+    painter.setPen(QPen(QColor("#9f7aea"), 1.2))
+    painter.drawLine(QPointF(27, 17), QPointF(33, 23))
+    painter.drawLine(QPointF(33, 23), QPointF(30, 33))
+    painter.drawLine(QPointF(30, 33), QPointF(36, 40))
+
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor("#22c55e"))
+    painter.drawEllipse(QRectF(36, 36, 20, 20))
+
+    plus_pen = QPen(QColor("white"), 2.4)
+    plus_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    painter.setPen(plus_pen)
+    painter.drawLine(46, 41, 46, 51)
+    painter.drawLine(41, 46, 51, 46)
     painter.end()
     return QIcon(pixmap)
 
@@ -1483,7 +1553,7 @@ class QuickAddWindow(QWidget):
             return
 
         if self._markdown_prefix_title:
-            current_time = datetime.now().strftime("%H:%M")
+            current_time = datetime.now().strftime("%H:%M:%S")
             content = f"## {self._markdown_prefix_title} {current_time}\n\n{content}"
 
         try:
@@ -1492,6 +1562,9 @@ class QuickAddWindow(QWidget):
             QMessageBox.critical(self, "错误", f"命令模板解析失败: {exc}")
             return
 
+        exec_env = os.environ.copy()
+        exec_env["PATH"] = build_runtime_path()
+
         try:
             result = subprocess.run(
                 args,
@@ -1499,18 +1572,24 @@ class QuickAddWindow(QWidget):
                 capture_output=True,
                 text=True,
                 timeout=20,
+                env=exec_env,
             )
         except FileNotFoundError:
             available = []
             for name in ("obsidian", "obsidiancli", "obsidian-cli"):
-                path = shutil.which(name)
+                path = shutil.which(name, path=exec_env.get("PATH", ""))
                 if path:
                     available.append(f"{name} -> {path}")
             found = "\n".join(available) if available else "(none)"
             QMessageBox.critical(
                 self,
                 "命令不存在",
-                f"找不到命令: {args[0]}\n\n可用相关命令:\n{found}\n\n期望模板:\n{COMMAND_TEMPLATE}",
+                (
+                    f"找不到命令: {args[0]}\n\n"
+                    f"可用相关命令:\n{found}\n\n"
+                    f"当前 PATH:\n{exec_env.get('PATH', '')}\n\n"
+                    f"期望模板:\n{COMMAND_TEMPLATE}"
+                ),
             )
             return
         except subprocess.TimeoutExpired:
@@ -1740,8 +1819,16 @@ class TrayController(QObject):
 
 
 def main() -> int:
+    os.environ["PATH"] = build_runtime_path()
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+    if sys.platform == "darwin" and objc is not None:
+        try:
+            ns_app = NSApp() if NSApp is not None else None
+            if ns_app is not None and hasattr(ns_app, "setActivationPolicy_"):
+                ns_app.setActivationPolicy_(MACOS_ACTIVATION_POLICY_ACCESSORY)
+        except Exception:
+            pass
 
     icon = build_app_icon()
     app.setWindowIcon(icon)
