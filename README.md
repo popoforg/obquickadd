@@ -1,4 +1,4 @@
-# Obsidian Quick Daily Add (PyQt6)
+# Obsidian QuickAdd (PyQt6)
 
 一个基于 `PyQt6` 的快速写日记小工具。
 
