@@ -10,6 +10,9 @@ import sys
 import re
 import time
 import os
+import plistlib
+import ctypes
+import ctypes.util
 from ctypes import c_void_p
 from datetime import date, datetime
 from pathlib import Path
@@ -51,6 +54,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
@@ -104,6 +108,7 @@ SETTINGS_HOTKEY_KEY = "hotkey/show_window"
 SETTINGS_TASK_HOTKEY_KEY = "hotkey/task_toggle"
 SETTINGS_SEND_HOTKEY_KEY = "hotkey/send_content"
 SETTINGS_PREFIX_TITLE_KEY = "markdown/prefix_title"
+SETTINGS_LAUNCH_AT_LOGIN_KEY = "app/launch_at_login"
 DEFAULT_HOTKEY_QT = "Meta+Shift+O" if sys.platform == "darwin" else "Ctrl+Alt+O"
 DEFAULT_HOTKEY_TOKEN = "<cmd>+<shift>+o" if sys.platform == "darwin" else "<ctrl>+<alt>+o"
 DEFAULT_TASK_HOTKEY_QT = "Ctrl+L" if sys.platform == "darwin" else "Ctrl+L"
@@ -114,6 +119,7 @@ TASK_UNCHECKED_PREFIXES = ("☐ ", "☐\ufe0e ", "⬜ ", "⬜️ ")
 TASK_CHECKED_PREFIXES = ("☑ ", "☑\ufe0e ", "☑️ ", "✅ ")
 TASK_MARKDOWN_PREFIXES = ("- [ ] ", "- [x] ", "- [X] ")
 MACOS_ACTIVATION_POLICY_ACCESSORY = 1
+MACOS_LAUNCH_AGENT_LABEL = "com.popoforg.obsidianquickadd"
 PATH_FALLBACK_DIRS = [
     "/opt/homebrew/bin",
     "/usr/local/bin",
@@ -158,6 +164,117 @@ def build_runtime_path() -> str:
         shell_path = ""
 
     return _merge_path_lists(current_path, fallback_path, shell_path)
+
+
+def _is_executable_file(path: Path) -> bool:
+    try:
+        return path.is_file() and os.access(path, os.X_OK)
+    except Exception:
+        return False
+
+
+def _iter_executables_in_path(name: str, path_env: str) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+    for part in path_env.split(":"):
+        directory = part.strip()
+        if not directory:
+            continue
+        candidate = Path(directory) / name
+        if not _is_executable_file(candidate):
+            continue
+        resolved = str(candidate.resolve())
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        found.append(resolved)
+    return found
+
+
+def resolve_obsidian_executable(path_env: str) -> tuple[str | None, list[str]]:
+    candidates = _iter_executables_in_path("obsidian", path_env)
+    app_binary_suffix = "/Obsidian.app/Contents/MacOS/obsidian"
+    for exe in candidates:
+        if not exe.endswith(app_binary_suffix):
+            return exe, candidates
+    if candidates:
+        return candidates[0], candidates
+    return None, candidates
+
+
+def setting_to_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def launch_at_login_supported() -> bool:
+    return sys.platform == "darwin"
+
+
+def _macos_launch_agent_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{MACOS_LAUNCH_AGENT_LABEL}.plist"
+
+
+def _macos_launch_program_arguments() -> list[str]:
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    return [sys.executable, str(Path(__file__).resolve())]
+
+
+def is_launch_at_login_enabled() -> bool:
+    if not launch_at_login_supported():
+        return False
+    return _macos_launch_agent_path().exists()
+
+
+def set_launch_at_login(enabled: bool) -> None:
+    if not launch_at_login_supported():
+        if enabled:
+            raise RuntimeError("当前系统不支持开机启动设置")
+        return
+
+    agent_path = _macos_launch_agent_path()
+    uid_domain = f"gui/{os.getuid()}"
+
+    if enabled:
+        agent_path.parent.mkdir(parents=True, exist_ok=True)
+        plist_data = {
+            "Label": MACOS_LAUNCH_AGENT_LABEL,
+            "ProgramArguments": _macos_launch_program_arguments(),
+            "RunAtLoad": True,
+            "KeepAlive": False,
+            "LimitLoadToSessionType": "Aqua",
+            "EnvironmentVariables": {"PATH": build_runtime_path()},
+            "WorkingDirectory": str(Path.home()),
+        }
+        with agent_path.open("wb") as fp:
+            plistlib.dump(plist_data, fp)
+
+        subprocess.run(
+            ["launchctl", "bootout", uid_domain, str(agent_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["launchctl", "bootstrap", uid_domain, str(agent_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return
+
+    subprocess.run(
+        ["launchctl", "bootout", uid_domain, str(agent_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if agent_path.exists():
+        agent_path.unlink()
 
 
 def build_app_icon() -> QIcon:
@@ -289,6 +406,17 @@ def parse_shortcut_text(text: str) -> QKeySequence:
     return QKeySequence(normalized)
 
 
+def normalize_macos_show_shortcut(sequence: QKeySequence) -> QKeySequence:
+    if sys.platform != "darwin" or sequence.isEmpty():
+        return sequence
+    portable = sequence.toString(QKeySequence.SequenceFormat.PortableText).strip()
+    # In this app, show-window shortcut is expected to be Cmd-based on macOS.
+    # If an old saved value uses Meta (Control key), normalize it to Cmd.
+    if "Meta+" in portable and "Ctrl+" not in portable:
+        return QKeySequence(portable.replace("Meta+", "Ctrl+"))
+    return sequence
+
+
 class ShortcutCaptureEdit(QLineEdit):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -409,6 +537,175 @@ class GlobalHotkeyBridge(QObject):
     activated = pyqtSignal()
 
 
+def parse_hotkey_token(token: str) -> tuple[set[str], str | None]:
+    parts = [part.strip().lower() for part in token.split("+") if part.strip()]
+    modifiers: set[str] = set()
+    key: str | None = None
+    for part in parts:
+        normalized = part[1:-1] if part.startswith("<") and part.endswith(">") else part
+        if normalized in {"cmd", "ctrl", "alt", "shift"}:
+            modifiers.add(normalized)
+        else:
+            key = normalized
+    return modifiers, key
+
+
+if sys.platform == "darwin":
+    class MacGlobalHotkeyManager:
+        K_EVENT_CLASS_KEYBOARD = 0x6B657962  # 'keyb'
+        K_EVENT_HOTKEY_PRESSED = 6
+        K_CMD_KEY = 1 << 8
+        K_SHIFT_KEY = 1 << 9
+        K_OPTION_KEY = 1 << 11
+        K_CONTROL_KEY = 1 << 12
+        K_HOTKEY_SIGNATURE = 0x4F425141  # 'OBQA'
+
+        class EventTypeSpec(ctypes.Structure):
+            _fields_ = [("eventClass", ctypes.c_uint32), ("eventKind", ctypes.c_uint32)]
+
+        class EventHotKeyID(ctypes.Structure):
+            _fields_ = [("signature", ctypes.c_uint32), ("id", ctypes.c_uint32)]
+
+        EVENT_HANDLER_PROC = ctypes.CFUNCTYPE(
+            ctypes.c_int32,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        )
+
+        KEY_CODE_MAP = {
+            "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9,
+            "b": 11, "q": 12, "w": 13, "e": 14, "r": 15, "y": 16, "t": 17,
+            "1": 18, "2": 19, "3": 20, "4": 21, "6": 22, "5": 23, "=": 24, "9": 25, "7": 26, "-": 27,
+            "8": 28, "0": 29, "]": 30, "o": 31, "u": 32, "[": 33, "i": 34, "p": 35,
+            "enter": 36, "l": 37, "j": 38, "'": 39, "k": 40, ";": 41, "\\": 42, ",": 43, "/": 44, "n": 45,
+            "m": 46, ".": 47, "tab": 48, "space": 49, "`": 50, "backspace": 51, "esc": 53,
+            "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97, "f7": 98, "f8": 100,
+            "f9": 101, "f10": 109, "f11": 103, "f12": 111,
+            "home": 115, "page_up": 116, "delete": 117, "end": 119, "page_down": 121,
+            "left": 123, "right": 124, "down": 125, "up": 126,
+        }
+
+        def __init__(self, bridge: GlobalHotkeyBridge, hotkey_token: str = DEFAULT_HOTKEY_TOKEN) -> None:
+            self.bridge = bridge
+            self.hotkey_token = hotkey_token
+            self._event_handler_ref = ctypes.c_void_p()
+            self._hotkey_ref = ctypes.c_void_p()
+            self._event_handler_proc: Any = None
+            carbon_lib = ctypes.util.find_library("Carbon") or "/System/Library/Frameworks/Carbon.framework/Carbon"
+            self._carbon = ctypes.CDLL(carbon_lib)
+            self._setup_cfunc_signatures()
+
+        def _setup_cfunc_signatures(self) -> None:
+            self._carbon.GetApplicationEventTarget.restype = ctypes.c_void_p
+            self._carbon.InstallEventHandler.argtypes = [
+                ctypes.c_void_p,
+                self.EVENT_HANDLER_PROC,
+                ctypes.c_uint32,
+                ctypes.POINTER(self.EventTypeSpec),
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_void_p),
+            ]
+            self._carbon.InstallEventHandler.restype = ctypes.c_int32
+            self._carbon.RemoveEventHandler.argtypes = [ctypes.c_void_p]
+            self._carbon.RemoveEventHandler.restype = ctypes.c_int32
+            self._carbon.RegisterEventHotKey.argtypes = [
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                self.EventHotKeyID,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_void_p),
+            ]
+            self._carbon.RegisterEventHotKey.restype = ctypes.c_int32
+            self._carbon.UnregisterEventHotKey.argtypes = [ctypes.c_void_p]
+            self._carbon.UnregisterEventHotKey.restype = ctypes.c_int32
+
+        def _token_to_carbon_hotkey(self, hotkey_token: str) -> tuple[int, int] | None:
+            modifiers, key = parse_hotkey_token(hotkey_token)
+            if key is None:
+                return None
+            key_code = self.KEY_CODE_MAP.get(key)
+            if key_code is None:
+                return None
+
+            carbon_modifiers = 0
+            if "cmd" in modifiers:
+                carbon_modifiers |= self.K_CMD_KEY
+            if "shift" in modifiers:
+                carbon_modifiers |= self.K_SHIFT_KEY
+            if "alt" in modifiers:
+                carbon_modifiers |= self.K_OPTION_KEY
+            if "ctrl" in modifiers:
+                carbon_modifiers |= self.K_CONTROL_KEY
+            return key_code, carbon_modifiers
+
+        def _ensure_event_handler(self) -> bool:
+            if self._event_handler_ref.value:
+                return True
+
+            @self.EVENT_HANDLER_PROC
+            def _callback(_next_handler, _event_ref, _user_data):
+                self.bridge.activated.emit()
+                return 0
+
+            self._event_handler_proc = _callback
+            target = self._carbon.GetApplicationEventTarget()
+            if not target:
+                return False
+
+            event_type = self.EventTypeSpec(self.K_EVENT_CLASS_KEYBOARD, self.K_EVENT_HOTKEY_PRESSED)
+            status = self._carbon.InstallEventHandler(
+                target,
+                self._event_handler_proc,
+                1,
+                ctypes.byref(event_type),
+                None,
+                ctypes.byref(self._event_handler_ref),
+            )
+            return status == 0 and bool(self._event_handler_ref.value)
+
+        def _register_hotkey(self, hotkey_token: str) -> bool:
+            parsed = self._token_to_carbon_hotkey(hotkey_token)
+            if parsed is None:
+                return False
+            key_code, modifiers = parsed
+            if not self._ensure_event_handler():
+                return False
+
+            if self._hotkey_ref.value:
+                self._carbon.UnregisterEventHotKey(self._hotkey_ref)
+                self._hotkey_ref = ctypes.c_void_p()
+
+            target = self._carbon.GetApplicationEventTarget()
+            hotkey_id = self.EventHotKeyID(self.K_HOTKEY_SIGNATURE, 1)
+            status = self._carbon.RegisterEventHotKey(
+                key_code,
+                modifiers,
+                hotkey_id,
+                target,
+                0,
+                ctypes.byref(self._hotkey_ref),
+            )
+            return status == 0 and bool(self._hotkey_ref.value)
+
+        def start(self) -> bool:
+            return self._register_hotkey(self.hotkey_token)
+
+        def stop(self) -> None:
+            if self._hotkey_ref.value:
+                self._carbon.UnregisterEventHotKey(self._hotkey_ref)
+                self._hotkey_ref = ctypes.c_void_p()
+            if self._event_handler_ref.value:
+                self._carbon.RemoveEventHandler(self._event_handler_ref)
+                self._event_handler_ref = ctypes.c_void_p()
+            self._event_handler_proc = None
+
+        def set_hotkey(self, hotkey_token: str) -> bool:
+            self.hotkey_token = hotkey_token
+            return self._register_hotkey(hotkey_token)
+
+
 class GlobalHotkeyManager:
     def __init__(self, bridge: GlobalHotkeyBridge, hotkey_token: str = DEFAULT_HOTKEY_TOKEN) -> None:
         self.bridge = bridge
@@ -421,16 +718,7 @@ class GlobalHotkeyManager:
         self._hotkey_active = False
 
     def _parse_hotkey_token(self, token: str) -> tuple[set[str], str | None]:
-        parts = [part.strip().lower() for part in token.split("+") if part.strip()]
-        modifiers: set[str] = set()
-        key: str | None = None
-        for part in parts:
-            normalized = part[1:-1] if part.startswith("<") and part.endswith(">") else part
-            if normalized in {"cmd", "ctrl", "alt", "shift"}:
-                modifiers.add(normalized)
-            else:
-                key = normalized
-        return modifiers, key
+        return parse_hotkey_token(token)
 
     def _normalize_pynput_key(self, key_obj) -> tuple[str | None, bool]:
         if keyboard is None:
@@ -756,6 +1044,7 @@ class QuickAddWindow(QWidget):
         self._native_accessory: Any = None
         self._native_pin_button: Any = None
         self._native_window_ref: Any = None
+        self._background_processes: list[subprocess.Popen[str]] = []
         self.setWindowTitle(APP_TITLE)
         self.setObjectName("quickAddRoot")
         self.resize(440, 280)
@@ -1076,6 +1365,13 @@ class QuickAddWindow(QWidget):
 
         self.show()
         self._setup_native_titlebar_controls()
+        if sys.platform == "darwin" and objc is not None:
+            try:
+                ns_app = NSApp() if NSApp is not None else None
+                if ns_app is not None and hasattr(ns_app, "activateIgnoringOtherApps_"):
+                    ns_app.activateIgnoringOtherApps_(True)
+            except Exception:
+                pass
         if sys.platform == "darwin":
             QTimer.singleShot(0, self._hide_native_traffic_lights)
             QTimer.singleShot(0, self._setup_native_titlebar_controls)
@@ -1564,6 +1860,42 @@ class QuickAddWindow(QWidget):
 
         exec_env = os.environ.copy()
         exec_env["PATH"] = build_runtime_path()
+        if args and args[0] == "obsidian":
+            resolved_executable, all_obsidian_bins = resolve_obsidian_executable(exec_env.get("PATH", ""))
+            if resolved_executable is None:
+                details = "\n".join(all_obsidian_bins) if all_obsidian_bins else "(none)"
+                QMessageBox.critical(
+                    self,
+                    "命令配置错误",
+                    (
+                        "未找到可用的 `obsidian` 命令。\n\n"
+                        f"检测到的 obsidian 路径:\n{details}"
+                    ),
+                )
+                return
+            args = [resolved_executable, *args[1:]]
+            if resolved_executable.endswith("/Obsidian.app/Contents/MacOS/obsidian"):
+                try:
+                    process = subprocess.Popen(
+                        args,
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        env=exec_env,
+                        start_new_session=True,
+                    )
+                    self._background_processes.append(process)
+                    self._background_processes = [
+                        proc for proc in self._background_processes if proc.poll() is None
+                    ]
+                    self.content_text.clear()
+                    self._show_success_tip()
+                    return
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    QMessageBox.critical(self, "执行错误", str(exc))
+                    return
 
         try:
             result = subprocess.run(
@@ -1615,12 +1947,13 @@ class ShortcutSettingsDialog(QDialog):
         task_sequence: QKeySequence,
         send_sequence: QKeySequence,
         prefix_title: str,
+        launch_at_login_enabled: bool,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("快捷键设置")
         self.setModal(True)
-        self.resize(460, 250)
+        self.resize(460, 285)
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -1645,6 +1978,13 @@ class ShortcutSettingsDialog(QDialog):
         self.prefix_title_edit.setPlaceholderText("例如: 随想")
         self.prefix_title_edit.setText(prefix_title)
         form.addRow("Markdown前缀标题", self.prefix_title_edit)
+
+        self.launch_at_login_checkbox = QCheckBox("开机启动", self)
+        self.launch_at_login_checkbox.setChecked(launch_at_login_enabled)
+        if not launch_at_login_supported():
+            self.launch_at_login_checkbox.setEnabled(False)
+            self.launch_at_login_checkbox.setToolTip("当前系统暂不支持")
+        form.addRow("系统启动", self.launch_at_login_checkbox)
         layout.addLayout(form)
 
         hint_label = QLabel("示例: Cmd+Shift+O / Cmd+L / Cmd+Enter；前缀为空则不拼接标题", self)
@@ -1667,13 +2007,15 @@ class ShortcutSettingsDialog(QDialog):
         self.task_sequence_edit.set_key_sequence(QKeySequence(DEFAULT_TASK_HOTKEY_QT))
         self.send_sequence_edit.set_key_sequence(QKeySequence(DEFAULT_SEND_HOTKEY_QT))
         self.prefix_title_edit.clear()
+        self.launch_at_login_checkbox.setChecked(False)
 
-    def selected_values(self) -> tuple[QKeySequence, QKeySequence, QKeySequence, str]:
+    def selected_values(self) -> tuple[QKeySequence, QKeySequence, QKeySequence, str, bool]:
         return (
             self.show_sequence_edit.key_sequence(),
             self.task_sequence_edit.key_sequence(),
             self.send_sequence_edit.key_sequence(),
             self.prefix_title_edit.text().strip(),
+            self.launch_at_login_checkbox.isChecked(),
         )
 
 
@@ -1733,7 +2075,7 @@ class TrayController(QObject):
     def notify_hotkey_fallback(self) -> None:
         self.tray.showMessage(
             APP_TITLE,
-            f"未检测到 pynput，全局快捷键不可用。\n当前可用: {self._current_hotkey_label} (应用激活时)",
+            f"全局快捷键不可用（可能是权限或环境问题）。\n当前可用: {self._current_hotkey_label} (应用激活时)",
             QSystemTrayIcon.MessageIcon.Information,
             3500,
         )
@@ -1744,11 +2086,16 @@ class TrayController(QObject):
         self.window.set_shortcuts_enabled(False)
         self.window.show_window()
         old_hotkey_token = self.hotkey_manager.hotkey_token
+        current_launch_at_login = setting_to_bool(self.settings.value(SETTINGS_LAUNCH_AT_LOGIN_KEY, False))
+        if launch_at_login_supported():
+            current_launch_at_login = is_launch_at_login_enabled()
+            self.settings.setValue(SETTINGS_LAUNCH_AT_LOGIN_KEY, current_launch_at_login)
         dialog = ShortcutSettingsDialog(
             self.window.show_window_shortcut(),
             self.window.task_shortcut_sequence(),
             self.window.send_shortcut_sequence(),
             self.window.markdown_prefix_title(),
+            current_launch_at_login,
             self.window,
         )
         old_show_sequence = self.window.show_window_shortcut()
@@ -1756,7 +2103,8 @@ class TrayController(QObject):
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
 
-            show_sequence, task_sequence, send_sequence, prefix_title = dialog.selected_values()
+            show_sequence, task_sequence, send_sequence, prefix_title, launch_at_login_enabled = dialog.selected_values()
+            show_sequence = normalize_macos_show_shortcut(show_sequence)
             if show_sequence.isEmpty() or task_sequence.isEmpty() or send_sequence.isEmpty():
                 QMessageBox.warning(self.window, "设置失败", "快捷键不能为空")
                 return
@@ -1791,21 +2139,29 @@ class TrayController(QObject):
             )
             self.settings.setValue(SETTINGS_PREFIX_TITLE_KEY, prefix_title)
 
+            if launch_at_login_supported():
+                try:
+                    set_launch_at_login(launch_at_login_enabled)
+                    current_launch_at_login = launch_at_login_enabled
+                except Exception as exc:
+                    QMessageBox.warning(
+                        self.window,
+                        "开机启动设置失败",
+                        f"未能更新开机启动状态：{exc}",
+                    )
+            self.settings.setValue(SETTINGS_LAUNCH_AT_LOGIN_KEY, current_launch_at_login)
+
             show_changed = show_sequence.toString(QKeySequence.SequenceFormat.PortableText) != old_show_sequence.toString(
                 QKeySequence.SequenceFormat.PortableText
             )
             if show_changed:
-                if keyboard is None:
-                    self.hotkey_manager.hotkey_token = hotkey_token
-                    self.notify_hotkey_fallback()
-                else:
-                    if not self.hotkey_manager.set_hotkey(hotkey_token):
-                        self.hotkey_manager.set_hotkey(old_hotkey_token)
-                        QMessageBox.warning(
-                            self.window,
-                            "全局快捷键设置失败",
-                            "新快捷键注册失败，已恢复旧快捷键。",
-                        )
+                if not self.hotkey_manager.set_hotkey(hotkey_token):
+                    self.hotkey_manager.set_hotkey(old_hotkey_token)
+                    QMessageBox.warning(
+                        self.window,
+                        "全局快捷键设置失败",
+                        "新快捷键注册失败，已恢复旧快捷键。",
+                    )
         except Exception as exc:
             QMessageBox.critical(
                 self.window,
@@ -1838,6 +2194,11 @@ def main() -> int:
     current_show_shortcut = QKeySequence(saved_show_shortcut)
     if current_show_shortcut.isEmpty():
         current_show_shortcut = QKeySequence(DEFAULT_HOTKEY_QT)
+    current_show_shortcut = normalize_macos_show_shortcut(current_show_shortcut)
+    settings.setValue(
+        SETTINGS_HOTKEY_KEY,
+        current_show_shortcut.toString(QKeySequence.SequenceFormat.PortableText),
+    )
 
     saved_task_shortcut = settings.value(SETTINGS_TASK_HOTKEY_KEY, DEFAULT_TASK_HOTKEY_QT, str)
     current_task_shortcut = QKeySequence(saved_task_shortcut)
@@ -1851,6 +2212,16 @@ def main() -> int:
 
     saved_prefix_title = settings.value(SETTINGS_PREFIX_TITLE_KEY, "", str)
     current_prefix_title = saved_prefix_title.strip() if isinstance(saved_prefix_title, str) else ""
+    current_launch_at_login = setting_to_bool(settings.value(SETTINGS_LAUNCH_AT_LOGIN_KEY, False))
+    if launch_at_login_supported():
+        try:
+            set_launch_at_login(current_launch_at_login)
+            current_launch_at_login = is_launch_at_login_enabled()
+        except Exception:
+            current_launch_at_login = is_launch_at_login_enabled()
+        settings.setValue(SETTINGS_LAUNCH_AT_LOGIN_KEY, current_launch_at_login)
+    else:
+        settings.setValue(SETTINGS_LAUNCH_AT_LOGIN_KEY, False)
 
     window = QuickAddWindow()
     window.set_show_window_shortcut(current_show_shortcut)
@@ -1862,9 +2233,28 @@ def main() -> int:
     hotkey_bridge.activated.connect(window.handle_show_shortcut)
 
     hotkey_token = key_sequence_to_pynput_token(current_show_shortcut) or DEFAULT_HOTKEY_TOKEN
-    hotkey_manager = GlobalHotkeyManager(hotkey_bridge, hotkey_token)
+    if sys.platform == "darwin":
+        hotkey_manager: Any = MacGlobalHotkeyManager(hotkey_bridge, hotkey_token)
+    else:
+        hotkey_manager = GlobalHotkeyManager(hotkey_bridge, hotkey_token)
     tray = TrayController(app, window, icon, hotkey_manager, settings)
     hotkey_ready = hotkey_manager.start()
+    if not hotkey_ready and hotkey_token != DEFAULT_HOTKEY_TOKEN:
+        default_sequence = QKeySequence(DEFAULT_HOTKEY_QT)
+        default_token = key_sequence_to_pynput_token(default_sequence) or DEFAULT_HOTKEY_TOKEN
+        if hotkey_manager.set_hotkey(default_token):
+            hotkey_ready = True
+            window.set_show_window_shortcut(default_sequence)
+            settings.setValue(
+                SETTINGS_HOTKEY_KEY,
+                default_sequence.toString(QKeySequence.SequenceFormat.PortableText),
+            )
+            tray._current_hotkey_label = hotkey_label(default_sequence)
+            tray.tray.setToolTip(f"{APP_TITLE} ({tray._current_hotkey_label})")
+    if sys.platform == "darwin" and not hotkey_ready:
+        hotkey_manager = GlobalHotkeyManager(hotkey_bridge, hotkey_token)
+        tray.hotkey_manager = hotkey_manager
+        hotkey_ready = hotkey_manager.start()
     if not hotkey_ready:
         QTimer.singleShot(600, tray.notify_hotkey_fallback)
 

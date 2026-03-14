@@ -39,4 +39,4 @@ python3 quick_add_gui.py
 obsidian daily:append content=__CONTENT__
 ```
 
-请确保你已经在 Obsidian 中启用并注册 CLI（`obsidian` 命令）。
+请确保你已经安装并可执行 `obsidian` 命令（ObsidianCLI）。

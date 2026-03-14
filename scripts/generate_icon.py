@@ -102,7 +102,18 @@ def main() -> int:
         raise RuntimeError(f"Failed to write {BASE_PNG}")
 
     build_iconset(BASE_PNG, ICONSET_DIR)
-    run(["iconutil", "-c", "icns", str(ICONSET_DIR), "-o", str(ICNS_PATH)])
+    iconutil_result = subprocess.run(
+        ["iconutil", "-c", "icns", str(ICONSET_DIR), "-o", str(ICNS_PATH)],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if iconutil_result.returncode != 0 and not ICNS_PATH.exists():
+        raise RuntimeError(
+            f"iconutil failed and no existing icns available: {iconutil_result.stderr or iconutil_result.stdout}"
+        )
+    if iconutil_result.returncode != 0:
+        print("iconutil failed, reusing existing icns file.")
     print(f"Generated icon: {ICNS_PATH}")
     return 0
 
