@@ -5,8 +5,11 @@
 ## 功能
 
 - 启动后窗口显示在屏幕中心
-- 输入内容，点击 `发送` 追加到 Obsidian 今日日记
-- 成功后显示悬浮提示 `发送成功`，2 秒自动消失
+- 设置中可配置 `Vault名称`（仅名称，不是路径）和“保存文件夹”（相对 vault 的路径）
+- 输入内容后点击 `发送`，会先在该文件夹中新建一篇笔记
+- 新笔记文件名使用当前时间，精确到秒，例如 `2026-04-09 21-35-42.md`
+- 然后自动将该笔记以嵌入引用 `![[...]]` 的方式追加到 Obsidian 今日日记
+- 成功后显示悬浮提示 `保存成功`，2 秒自动消失
 - 托盘（状态栏）图标常驻：点击图标显示窗口
 - 窗口显示时，点击窗口外部区域自动隐藏
 - 支持快捷键显示窗口
@@ -26,10 +29,12 @@ pip3 install PyQt6 pynput
 
 ## 前提（ObsidianCLI）
 
-本工具的“发送”能力基于 `ObsidianCLI`。
+本工具写入今日日记的能力基于 `ObsidianCLI`。
 
 - 你必须能在终端直接执行 `obsidian` 命令
 - `obsidian` 需要支持 `daily:append content=...` 子命令
+- 设置里的 `Vault名称` 直接填写 Obsidian 里显示的 vault 名称（例如 `ObNotes`）
+- “保存文件夹”需要填写相对该 vault 根目录的子路径，例如 `01-DailyNotes/QuickAdd`
 
 可先用下面命令自检：
 
@@ -67,4 +72,4 @@ python3 quick_add_gui.py
 obsidian daily:append content=__CONTENT__
 ```
 
-如果 `obsidian` 命令不可用或不支持 `daily:append`，发送会失败。
+如果 `obsidian` 命令不可用或不支持 `daily:append`，写入今日日记会失败。

@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import shlex
-import shutil
 import subprocess
 import sys
 import re
@@ -13,8 +11,9 @@ import os
 import plistlib
 import ctypes
 import ctypes.util
+import uuid
 from ctypes import c_void_p
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +32,11 @@ from PyQt6.QtCore import (
     QTimer,
     Qt,
     QSettings,
+    QMimeData,
+    QUrl,
+    QByteArray,
+    QBuffer,
+    QIODevice,
     pyqtSignal,
 )
 from PyQt6.QtGui import (
@@ -51,6 +55,9 @@ from PyQt6.QtGui import (
     QTextBlockFormat,
     QTextCharFormat,
     QTextCursor,
+    QTextDocument,
+    QTextImageFormat,
+    QImage,
 )
 from PyQt6.QtWidgets import (
     QApplication,
@@ -101,14 +108,15 @@ else:  # pragma: no cover - platform split
     objc = None
 
 APP_TITLE = "Obsidian QuickAdd"
-COMMAND_TEMPLATE = "obsidian daily:append content=__CONTENT__"
 SETTINGS_ORG = "ObsidianQuickAdd"
 SETTINGS_APP = "QuickAdd"
 SETTINGS_HOTKEY_KEY = "hotkey/show_window"
 SETTINGS_TASK_HOTKEY_KEY = "hotkey/task_toggle"
 SETTINGS_SEND_HOTKEY_KEY = "hotkey/send_content"
-SETTINGS_PREFIX_TITLE_KEY = "markdown/prefix_title"
 SETTINGS_LAUNCH_AT_LOGIN_KEY = "app/launch_at_login"
+SETTINGS_VAULT_NAME_KEY = "obsidian/vault_name"
+SETTINGS_VAULT_ROOT_KEY = "obsidian/vault_root"  # legacy key
+SETTINGS_SAVE_FOLDER_KEY = "notes/save_folder"
 DEFAULT_HOTKEY_QT = "Meta+Shift+O" if sys.platform == "darwin" else "Ctrl+Alt+O"
 DEFAULT_HOTKEY_TOKEN = "<cmd>+<shift>+o" if sys.platform == "darwin" else "<ctrl>+<alt>+o"
 DEFAULT_TASK_HOTKEY_QT = "Ctrl+L" if sys.platform == "darwin" else "Ctrl+L"
@@ -876,7 +884,12 @@ class ContentTextEdit(QTextEdit):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._line_spacing_percent = 150
+        self._clipboard_image_bytes: dict[str, bytes] = {}
         self._apply_default_line_spacing()
+
+    def clear(self) -> None:
+        super().clear()
+        self._clipboard_image_bytes.clear()
 
     def _apply_default_line_spacing(self) -> None:
         cursor = QTextCursor(self.document())
@@ -997,6 +1010,211 @@ class ContentTextEdit(QTextEdit):
         self._apply_line_spacing_to_current_block()
         return True
 
+    def canInsertFromMimeData(self, source: QMimeData | None) -> bool:
+        if source is not None and source.hasImage():
+            return True
+        return super().canInsertFromMimeData(source)
+
+    def insertFromMimeData(self, source: QMimeData | None) -> None:
+        if source is not None and source.hasImage():
+            image = self._extract_image_from_mime(source)
+            if image is not None and not image.isNull():
+                self._insert_clipboard_image(image)
+                return
+        super().insertFromMimeData(source)
+
+    def _extract_image_from_mime(self, source: QMimeData) -> QImage | None:
+        image_data = source.imageData()
+        if isinstance(image_data, QImage):
+            return image_data
+        if isinstance(image_data, QPixmap):
+            return image_data.toImage()
+        if source.hasUrls():
+            for url in source.urls():
+                local_path = url.toLocalFile()
+                if not local_path:
+                    continue
+                image = QImage(local_path)
+                if not image.isNull():
+                    return image
+        return None
+
+    def _insert_clipboard_image(self, image: QImage) -> None:
+        image = self._trim_transparent_border(image)
+        image = self._trim_uniform_border(image)
+        resource_name = f"quickadd-image-{uuid.uuid4().hex}.png"
+        png_bytes = QByteArray()
+        buffer = QBuffer(png_bytes)
+        if buffer.open(QIODevice.OpenModeFlag.WriteOnly):
+            image.save(buffer, "PNG")
+            buffer.close()
+            self._clipboard_image_bytes[resource_name] = bytes(png_bytes)
+        self.document().addResource(
+            QTextDocument.ResourceType.ImageResource,
+            QUrl(resource_name),
+            image,
+        )
+
+        cursor = self.textCursor()
+        cursor.beginEditBlock()
+        if cursor.positionInBlock() != 0:
+            cursor.insertBlock()
+        self._apply_compact_image_block_format(cursor)
+
+        image_fmt = QTextImageFormat()
+        image_fmt.setName(resource_name)
+        max_width = max(220.0, float(self.viewport().width() - 40))
+        max_height = 210.0
+        width = float(max(1, image.width()))
+        height = float(max(1, image.height()))
+        scale = min(1.0, max_width / width, max_height / height)
+        image_fmt.setWidth(width * scale)
+        image_fmt.setHeight(height * scale)
+        cursor.insertImage(image_fmt)
+        cursor.insertBlock()
+        self._apply_default_line_spacing_to_cursor_block(cursor)
+        cursor.endEditBlock()
+        self.setTextCursor(cursor)
+
+    def _apply_compact_image_block_format(self, cursor: QTextCursor) -> None:
+        block_fmt = QTextBlockFormat(cursor.blockFormat())
+        block_fmt.setTopMargin(4)
+        block_fmt.setBottomMargin(6)
+        block_fmt.setLineHeight(
+            100,
+            QTextBlockFormat.LineHeightTypes.ProportionalHeight.value,
+        )
+        cursor.setBlockFormat(block_fmt)
+
+    def _apply_default_line_spacing_to_cursor_block(self, cursor: QTextCursor) -> None:
+        block_fmt = QTextBlockFormat(cursor.blockFormat())
+        block_fmt.setTopMargin(0)
+        block_fmt.setBottomMargin(0)
+        block_fmt.setLineHeight(
+            self._line_spacing_percent,
+            QTextBlockFormat.LineHeightTypes.ProportionalHeight.value,
+        )
+        cursor.setBlockFormat(block_fmt)
+
+    def _trim_transparent_border(self, image: QImage) -> QImage:
+        if image.isNull():
+            return image
+        width = image.width()
+        height = image.height()
+        if width < 2 or height < 2:
+            return image
+
+        alpha_threshold = 245
+        left = width
+        right = -1
+        top = height
+        bottom = -1
+
+        for y in range(height):
+            for x in range(width):
+                if image.pixelColor(x, y).alpha() >= alpha_threshold:
+                    if x < left:
+                        left = x
+                    if x > right:
+                        right = x
+                    if y < top:
+                        top = y
+                    if y > bottom:
+                        bottom = y
+
+        if right < left or bottom < top:
+            return image
+        if left == 0 and top == 0 and right == width - 1 and bottom == height - 1:
+            return image
+        return image.copy(left, top, right - left + 1, bottom - top + 1)
+
+    def _trim_uniform_border(self, image: QImage) -> QImage:
+        if image.isNull():
+            return image
+        width = image.width()
+        height = image.height()
+        if width < 12 or height < 12:
+            return image
+
+        # Prefer right-bottom corner as background seed.
+        bg = image.pixelColor(width - 1, height - 1)
+        if not self._is_light_color(bg):
+            # Do not crop dark screenshots (e.g. terminal) to avoid clipping content.
+            return image
+
+        x_step = max(1, width // 220)
+        y_step = max(1, height // 220)
+        x_margin = max(2, int(width * 0.05))
+        y_margin = max(2, int(height * 0.05))
+        x_from = min(x_margin, width - 1)
+        x_to = max(x_from + 1, width - x_margin)
+        y_from = min(y_margin, height - 1)
+        y_to = max(y_from + 1, height - y_margin)
+
+        def row_is_bg(y: int) -> bool:
+            total = 0
+            matched = 0
+            for x in range(x_from, x_to, x_step):
+                total += 1
+                if self._colors_close(bg, image.pixelColor(x, y)):
+                    matched += 1
+            return total > 0 and (matched / total) >= 0.90
+
+        def col_is_bg(x: int) -> bool:
+            total = 0
+            matched = 0
+            for y in range(y_from, y_to, y_step):
+                total += 1
+                if self._colors_close(bg, image.pixelColor(x, y)):
+                    matched += 1
+            return total > 0 and (matched / total) >= 0.90
+
+        top = 0
+        while top < height - 1 and row_is_bg(top):
+            top += 1
+        bottom = height - 1
+        while bottom > top and row_is_bg(bottom):
+            bottom -= 1
+        left = 0
+        while left < width - 1 and col_is_bg(left):
+            left += 1
+        right = width - 1
+        while right > left and col_is_bg(right):
+            right -= 1
+
+        new_width = right - left + 1
+        new_height = bottom - top + 1
+        if new_width <= 0 or new_height <= 0:
+            return image
+
+        trim_ratio = 1.0 - ((new_width * new_height) / float(width * height))
+        if trim_ratio < 0.02:
+            return image
+        return image.copy(left, top, new_width, new_height)
+
+    def _colors_close(self, a: QColor, b: QColor, tolerance: int = 16) -> bool:
+        return (
+            abs(a.red() - b.red()) <= tolerance
+            and abs(a.green() - b.green()) <= tolerance
+            and abs(a.blue() - b.blue()) <= tolerance
+            and abs(a.alpha() - b.alpha()) <= tolerance
+        )
+
+    def _is_light_color(self, color: QColor) -> bool:
+        luminance = 0.2126 * color.red() + 0.7152 * color.green() + 0.0722 * color.blue()
+        return luminance >= 200
+
+    def clipboard_images(self) -> dict[str, bytes]:
+        return dict(self._clipboard_image_bytes)
+
+    def replace_clipboard_image_refs(self, markdown_text: str, replacements: dict[str, str]) -> str:
+        resolved = markdown_text
+        for resource_name, target in replacements.items():
+            resolved = resolved.replace(f"({resource_name})", f"({target})")
+            resolved = resolved.replace(f'src="{resource_name}"', f'src="{target}"')
+            resolved = resolved.replace(f"src='{resource_name}'", f"src='{target}'")
+        return resolved
+
 
 class TitleBar(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -1036,7 +1254,8 @@ class QuickAddWindow(QWidget):
         self._suspend_auto_hide_for_emoji = False
         self._settings_dialog_open = False
         self._show_shortcut_cooldown_until = 0.0
-        self._markdown_prefix_title = ""
+        self._vault_name = ""
+        self._save_folder = ""
         self._last_position: tuple[int, int] | None = None
         self._base_window_flags = Qt.WindowType.Window
         self._native_controls_ready = False
@@ -1044,7 +1263,6 @@ class QuickAddWindow(QWidget):
         self._native_accessory: Any = None
         self._native_pin_button: Any = None
         self._native_window_ref: Any = None
-        self._background_processes: list[subprocess.Popen[str]] = []
         self.setWindowTitle(APP_TITLE)
         self.setObjectName("quickAddRoot")
         self.resize(440, 280)
@@ -1266,7 +1484,7 @@ class QuickAddWindow(QWidget):
         self.send_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self.send_shortcut.activated.connect(self.send_content)
 
-        self.success_tip = QLabel("发送成功", self)
+        self.success_tip = QLabel("保存成功", self)
         self.success_tip.setObjectName("successToast")
         self.success_tip.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.success_tip.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
@@ -1301,11 +1519,17 @@ class QuickAddWindow(QWidget):
     def send_shortcut_sequence(self) -> QKeySequence:
         return self.send_shortcut.key()
 
-    def set_markdown_prefix_title(self, title: str) -> None:
-        self._markdown_prefix_title = title.strip()
+    def set_save_folder(self, folder: str) -> None:
+        self._save_folder = folder.strip()
 
-    def markdown_prefix_title(self) -> str:
-        return self._markdown_prefix_title
+    def save_folder(self) -> str:
+        return self._save_folder
+
+    def set_vault_name(self, vault_name: str) -> None:
+        self._vault_name = vault_name.strip()
+
+    def vault_name(self) -> str:
+        return self._vault_name
 
     def set_settings_dialog_open(self, opened: bool) -> None:
         self._settings_dialog_open = opened
@@ -1540,14 +1764,6 @@ class QuickAddWindow(QWidget):
         self._apply_window_flags()
         self._update_native_pin_state()
 
-    def _build_command(self, content: str) -> list[str]:
-        if "__CONTENT__" not in COMMAND_TEMPLATE:
-            raise ValueError("Invalid command template: missing __CONTENT__")
-
-        template = COMMAND_TEMPLATE.replace("__TODAY__", date.today().isoformat())
-        args = shlex.split(template)
-        return [arg.replace("__CONTENT__", content) for arg in args]
-
     def _normalize_markdown_output(self, text: str) -> str:
         # QTextEdit.toMarkdown() may escape markdown control chars (e.g. \- \[x\]).
         return re.sub(r"\\([\\`*_{}\[\]()#+\-.!>])", r"\1", text)
@@ -1557,6 +1773,129 @@ class QuickAddWindow(QWidget):
         text = re.sub(r"(?m)^(\s*)(?:☑(?:[\ufe0e\ufe0f])?|✅)\s+", r"\1- [x] ", text)
         text = re.sub(r"(?m)^(\s*)•\s+", r"\1- ", text)
         return text
+
+    def _normalize_image_spacing(self, text: str) -> str:
+        # Avoid large blank gaps after image blocks when exporting from QTextEdit markdown/html.
+        text = re.sub(r"(?m)(!\[[^\]]*\]\([^)]+\))\n{3,}", r"\1\n\n", text)
+        text = re.sub(r"(?m)(<img\b[^>]*>)\n{3,}", r"\1\n\n", text)
+        return text
+
+    def _require_vault_name(self) -> str:
+        vault_name = self._vault_name.strip()
+        if not vault_name:
+            raise ValueError("请先在设置中配置 Vault 名称")
+        return vault_name
+
+    def _require_save_folder(self) -> str:
+        folder_text = self._save_folder.strip()
+        if not folder_text:
+            raise ValueError("请先在设置中配置保存文件夹")
+
+        folder_path = Path(folder_text)
+        if folder_path.is_absolute():
+            raise ValueError("保存文件夹请填写相对 Vault 的路径，例如: 01-DailyNotes/QuickAdd")
+        if ".." in folder_path.parts:
+            raise ValueError("保存文件夹不能包含 ..")
+        if str(folder_path).strip() in {"", "."}:
+            raise ValueError("保存文件夹不能是空路径")
+        return folder_path.as_posix().strip("/")
+
+    def _build_note_filename(self, now: datetime) -> str:
+        return f"{now.strftime('%Y-%m-%d %H-%M-%S')}.md"
+
+    def _build_note_relative_path(self, folder: str, now: datetime) -> str:
+        return Path(folder, self._build_note_filename(now)).as_posix()
+
+    def _build_embed_reference(self, note_relative_path: str) -> str:
+        embed_target = Path(note_relative_path).with_suffix("").as_posix()
+        return f"![[{embed_target}]]"
+
+    def _build_obsidian_command(self, command: str, **kwargs: str) -> list[str]:
+        vault_name = self._require_vault_name()
+        args = ["obsidian", command, f"vault={vault_name}"]
+        for key, value in kwargs.items():
+            if value is None:
+                continue
+            args.append(f"{key}={value}")
+        return args
+
+    def _run_obsidian_command(self, args: list[str], timeout_sec: int = 20) -> tuple[bool, str]:
+        ok, stdout, error = self._run_obsidian_command_with_output(args, timeout_sec=timeout_sec)
+        if not ok:
+            return False, error
+        return True, ""
+
+    def _run_obsidian_command_with_output(self, args: list[str], timeout_sec: int = 20) -> tuple[bool, str, str]:
+        exec_env = os.environ.copy()
+        exec_env["PATH"] = build_runtime_path()
+
+        if args and args[0] == "obsidian":
+            resolved_executable, all_obsidian_bins = resolve_obsidian_executable(exec_env.get("PATH", ""))
+            if resolved_executable is None:
+                details = "\n".join(all_obsidian_bins) if all_obsidian_bins else "(none)"
+                return False, "", (
+                    "未找到可用的 `obsidian` 命令。\n\n"
+                    f"检测到的 obsidian 路径:\n{details}"
+                )
+            args = [resolved_executable, *args[1:]]
+
+        try:
+            result = subprocess.run(
+                args,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+                env=exec_env,
+            )
+        except FileNotFoundError:
+            return False, "", f"找不到命令: {args[0]}"
+        except subprocess.TimeoutExpired:
+            return False, "", f"命令执行超时 ({timeout_sec}s)"
+        except OSError as exc:
+            return False, "", str(exc)
+
+        if result.returncode != 0:
+            details = (result.stderr or result.stdout or "(no output)").strip()
+            return False, "", f"Exit code: {result.returncode}\n\n{details}"
+
+        return True, (result.stdout or "").strip(), ""
+
+    def _resolve_vault_path(self) -> Path:
+        args = self._build_obsidian_command("vault", info="path")
+        ok, output, error = self._run_obsidian_command_with_output(args)
+        if not ok:
+            raise ValueError(f"无法读取 Vault 路径：\n{error}")
+        vault_path = Path(output.strip()).expanduser()
+        if not vault_path.exists() or not vault_path.is_dir():
+            raise ValueError(f"Vault 路径无效：\n{vault_path}")
+        return vault_path.resolve()
+
+    def _persist_clipboard_images(self, note_relative_path: str) -> dict[str, str]:
+        images = self.content_text.clipboard_images()
+        if not images:
+            return {}
+
+        vault_root = self._resolve_vault_path()
+        note_rel = Path(note_relative_path)
+        note_stem = note_rel.stem
+        assets_rel_dir = (note_rel.parent / "_assets").as_posix()
+        assets_abs_dir = (vault_root / assets_rel_dir).resolve()
+        assets_abs_dir.mkdir(parents=True, exist_ok=True)
+        safe_stem = re.sub(r"\s+", "_", note_stem)
+        safe_stem = re.sub(r"[^A-Za-z0-9._-]", "-", safe_stem)
+        if not safe_stem:
+            safe_stem = "quickadd-image"
+
+        replacements: dict[str, str] = {}
+        for index, (resource_name, image_bytes) in enumerate(images.items(), start=1):
+            image_filename = f"{safe_stem}-{index:02d}.png"
+            image_abs_path = assets_abs_dir / image_filename
+            image_abs_path.write_bytes(image_bytes)
+            # Use path relative to the note file itself, not vault root.
+            image_rel_path = f"_assets/{image_filename}"
+            replacements[resource_name] = image_rel_path
+        return replacements
 
     def _update_send_button_state(self) -> None:
         content = self.content_text.toPlainText().strip()
@@ -1840,6 +2179,7 @@ class QuickAddWindow(QWidget):
     def send_content(self) -> None:
         content = self.content_text.toMarkdown().strip()
         content = self._normalize_markdown_output(content)
+        content = self._normalize_image_spacing(content)
         content = self._visual_tasks_to_markdown(content)
         if not content:
             content = self.content_text.toPlainText().strip()
@@ -1848,92 +2188,30 @@ class QuickAddWindow(QWidget):
             QMessageBox.warning(self, "提示", "请先输入内容")
             return
 
-        if self._markdown_prefix_title:
-            current_time = datetime.now().strftime("%H:%M:%S")
-            content = f"## {self._markdown_prefix_title} {current_time}\n\n{content}"
-
         try:
-            args = self._build_command(content)
+            save_folder = self._require_save_folder()
+            note_relative_path = self._build_note_relative_path(save_folder, datetime.now())
+            image_replacements = self._persist_clipboard_images(note_relative_path)
+            content = self.content_text.replace_clipboard_image_refs(content, image_replacements)
+            create_args = self._build_obsidian_command(
+                "create",
+                path=note_relative_path,
+                content=content.rstrip() + "\n",
+            )
         except Exception as exc:
-            QMessageBox.critical(self, "错误", f"命令模板解析失败: {exc}")
+            QMessageBox.critical(self, "保存失败", str(exc))
             return
 
-        exec_env = os.environ.copy()
-        exec_env["PATH"] = build_runtime_path()
-        if args and args[0] == "obsidian":
-            resolved_executable, all_obsidian_bins = resolve_obsidian_executable(exec_env.get("PATH", ""))
-            if resolved_executable is None:
-                details = "\n".join(all_obsidian_bins) if all_obsidian_bins else "(none)"
-                QMessageBox.critical(
-                    self,
-                    "命令配置错误",
-                    (
-                        "未找到可用的 `obsidian` 命令。\n\n"
-                        f"检测到的 obsidian 路径:\n{details}"
-                    ),
-                )
-                return
-            args = [resolved_executable, *args[1:]]
-            if resolved_executable.endswith("/Obsidian.app/Contents/MacOS/obsidian"):
-                try:
-                    process = subprocess.Popen(
-                        args,
-                        stdin=subprocess.DEVNULL,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                        env=exec_env,
-                        start_new_session=True,
-                    )
-                    self._background_processes.append(process)
-                    self._background_processes = [
-                        proc for proc in self._background_processes if proc.poll() is None
-                    ]
-                    self.content_text.clear()
-                    self._show_success_tip()
-                    return
-                except FileNotFoundError:
-                    pass
-                except OSError as exc:
-                    QMessageBox.critical(self, "执行错误", str(exc))
-                    return
-
-        try:
-            result = subprocess.run(
-                args,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=20,
-                env=exec_env,
-            )
-        except FileNotFoundError:
-            available = []
-            for name in ("obsidian", "obsidiancli", "obsidian-cli"):
-                path = shutil.which(name, path=exec_env.get("PATH", ""))
-                if path:
-                    available.append(f"{name} -> {path}")
-            found = "\n".join(available) if available else "(none)"
-            QMessageBox.critical(
-                self,
-                "命令不存在",
-                (
-                    f"找不到命令: {args[0]}\n\n"
-                    f"可用相关命令:\n{found}\n\n"
-                    f"当前 PATH:\n{exec_env.get('PATH', '')}\n\n"
-                    f"期望模板:\n{COMMAND_TEMPLATE}"
-                ),
-            )
-            return
-        except subprocess.TimeoutExpired:
-            QMessageBox.critical(self, "超时", "命令执行超时 (20s)")
-            return
-        except OSError as exc:
-            QMessageBox.critical(self, "执行错误", str(exc))
+        ok, error = self._run_obsidian_command(create_args)
+        if not ok:
+            QMessageBox.critical(self, "保存失败", error)
             return
 
-        if result.returncode != 0:
-            details = (result.stderr or result.stdout or "(no output)").strip()
-            QMessageBox.critical(self, "发送失败", f"Exit code: {result.returncode}\n\n{details}")
+        daily_embed = self._build_embed_reference(note_relative_path)
+        daily_args = self._build_obsidian_command("daily:append", content=f"\n{daily_embed}")
+        ok, error = self._run_obsidian_command(daily_args)
+        if not ok:
+            QMessageBox.critical(self, "写入今日日记失败", error)
             return
 
         self.content_text.clear()
@@ -1946,14 +2224,15 @@ class ShortcutSettingsDialog(QDialog):
         show_sequence: QKeySequence,
         task_sequence: QKeySequence,
         send_sequence: QKeySequence,
-        prefix_title: str,
         launch_at_login_enabled: bool,
+        vault_name: str,
+        save_folder: str,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("快捷键设置")
+        self.setWindowTitle("设置")
         self.setModal(True)
-        self.resize(460, 285)
+        self.resize(700, 340)
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -1972,12 +2251,26 @@ class ShortcutSettingsDialog(QDialog):
         self.send_sequence_edit = ShortcutCaptureEdit(self)
         self.send_sequence_edit.setPlaceholderText("例如: Cmd+Enter")
         self.send_sequence_edit.set_key_sequence(send_sequence)
-        form.addRow("发送快捷键", self.send_sequence_edit)
+        form.addRow("保存快捷键", self.send_sequence_edit)
 
-        self.prefix_title_edit = QLineEdit(self)
-        self.prefix_title_edit.setPlaceholderText("例如: 随想")
-        self.prefix_title_edit.setText(prefix_title)
-        form.addRow("Markdown前缀标题", self.prefix_title_edit)
+        self.vault_name_edit = QLineEdit(self)
+        self.vault_name_edit.setPlaceholderText("例如: ObNotes")
+        self.vault_name_edit.setText(vault_name)
+        form.addRow("Vault名称", self.vault_name_edit)
+
+        save_folder_row = QWidget(self)
+        save_folder_layout = QHBoxLayout(save_folder_row)
+        save_folder_layout.setContentsMargins(0, 0, 0, 0)
+        save_folder_layout.setSpacing(8)
+
+        self.save_folder_edit = QLineEdit(self)
+        self.save_folder_edit.setPlaceholderText("例如: 01-DailyNotes/QuickAdd")
+        self.save_folder_edit.setText(save_folder)
+        self.save_folder_edit.setMinimumWidth(460)
+        self.save_folder_edit.setToolTip("填写相对 Vault 根目录的路径")
+        save_folder_layout.addWidget(self.save_folder_edit, 1)
+
+        form.addRow("保存文件夹", save_folder_row)
 
         self.launch_at_login_checkbox = QCheckBox("开机启动", self)
         self.launch_at_login_checkbox.setChecked(launch_at_login_enabled)
@@ -1987,7 +2280,7 @@ class ShortcutSettingsDialog(QDialog):
         form.addRow("系统启动", self.launch_at_login_checkbox)
         layout.addLayout(form)
 
-        hint_label = QLabel("示例: Cmd+Shift+O / Cmd+L / Cmd+Enter；前缀为空则不拼接标题", self)
+        hint_label = QLabel("示例: Vault名称填 ObNotes；保存文件夹填 01-DailyNotes/QuickAdd", self)
         hint_label.setStyleSheet("color: #6b746f; font-size: 12px;")
         layout.addWidget(hint_label)
 
@@ -2006,16 +2299,18 @@ class ShortcutSettingsDialog(QDialog):
         self.show_sequence_edit.set_key_sequence(QKeySequence(DEFAULT_HOTKEY_QT))
         self.task_sequence_edit.set_key_sequence(QKeySequence(DEFAULT_TASK_HOTKEY_QT))
         self.send_sequence_edit.set_key_sequence(QKeySequence(DEFAULT_SEND_HOTKEY_QT))
-        self.prefix_title_edit.clear()
+        self.vault_name_edit.clear()
+        self.save_folder_edit.clear()
         self.launch_at_login_checkbox.setChecked(False)
 
-    def selected_values(self) -> tuple[QKeySequence, QKeySequence, QKeySequence, str, bool]:
+    def selected_values(self) -> tuple[QKeySequence, QKeySequence, QKeySequence, bool, str, str]:
         return (
             self.show_sequence_edit.key_sequence(),
             self.task_sequence_edit.key_sequence(),
             self.send_sequence_edit.key_sequence(),
-            self.prefix_title_edit.text().strip(),
             self.launch_at_login_checkbox.isChecked(),
+            self.vault_name_edit.text().strip(),
+            self.save_folder_edit.text().strip(),
         )
 
 
@@ -2094,8 +2389,9 @@ class TrayController(QObject):
             self.window.show_window_shortcut(),
             self.window.task_shortcut_sequence(),
             self.window.send_shortcut_sequence(),
-            self.window.markdown_prefix_title(),
             current_launch_at_login,
+            self.window.vault_name(),
+            self.window.save_folder(),
             self.window,
         )
         old_show_sequence = self.window.show_window_shortcut()
@@ -2103,7 +2399,7 @@ class TrayController(QObject):
             if dialog.exec() != QDialog.DialogCode.Accepted:
                 return
 
-            show_sequence, task_sequence, send_sequence, prefix_title, launch_at_login_enabled = dialog.selected_values()
+            show_sequence, task_sequence, send_sequence, launch_at_login_enabled, vault_name, save_folder = dialog.selected_values()
             show_sequence = normalize_macos_show_shortcut(show_sequence)
             if show_sequence.isEmpty() or task_sequence.isEmpty() or send_sequence.isEmpty():
                 QMessageBox.warning(self.window, "设置失败", "快捷键不能为空")
@@ -2121,7 +2417,8 @@ class TrayController(QObject):
             self.window.set_show_window_shortcut(show_sequence)
             self.window.set_task_shortcut(task_sequence)
             self.window.set_send_shortcut(send_sequence)
-            self.window.set_markdown_prefix_title(prefix_title)
+            self.window.set_vault_name(vault_name)
+            self.window.set_save_folder(save_folder)
 
             self._current_hotkey_label = hotkey_label(show_sequence)
             self.tray.setToolTip(f"{APP_TITLE} ({self._current_hotkey_label})")
@@ -2137,7 +2434,8 @@ class TrayController(QObject):
                 SETTINGS_SEND_HOTKEY_KEY,
                 send_sequence.toString(QKeySequence.SequenceFormat.PortableText),
             )
-            self.settings.setValue(SETTINGS_PREFIX_TITLE_KEY, prefix_title)
+            self.settings.setValue(SETTINGS_VAULT_NAME_KEY, vault_name)
+            self.settings.setValue(SETTINGS_SAVE_FOLDER_KEY, save_folder)
 
             if launch_at_login_supported():
                 try:
@@ -2210,8 +2508,18 @@ def main() -> int:
     if current_send_shortcut.isEmpty():
         current_send_shortcut = QKeySequence(DEFAULT_SEND_HOTKEY_QT)
 
-    saved_prefix_title = settings.value(SETTINGS_PREFIX_TITLE_KEY, "", str)
-    current_prefix_title = saved_prefix_title.strip() if isinstance(saved_prefix_title, str) else ""
+    saved_vault_name = settings.value(SETTINGS_VAULT_NAME_KEY, "", str)
+    current_vault_name = saved_vault_name.strip() if isinstance(saved_vault_name, str) else ""
+    if not current_vault_name:
+        # Compatibility: derive vault name from legacy absolute vault path setting.
+        saved_vault_root = settings.value(SETTINGS_VAULT_ROOT_KEY, "", str)
+        legacy_vault_root = saved_vault_root.strip() if isinstance(saved_vault_root, str) else ""
+        if legacy_vault_root:
+            current_vault_name = Path(legacy_vault_root).name.strip()
+            if current_vault_name:
+                settings.setValue(SETTINGS_VAULT_NAME_KEY, current_vault_name)
+    saved_save_folder = settings.value(SETTINGS_SAVE_FOLDER_KEY, "", str)
+    current_save_folder = saved_save_folder.strip() if isinstance(saved_save_folder, str) else ""
     current_launch_at_login = setting_to_bool(settings.value(SETTINGS_LAUNCH_AT_LOGIN_KEY, False))
     if launch_at_login_supported():
         try:
@@ -2227,7 +2535,8 @@ def main() -> int:
     window.set_show_window_shortcut(current_show_shortcut)
     window.set_task_shortcut(current_task_shortcut)
     window.set_send_shortcut(current_send_shortcut)
-    window.set_markdown_prefix_title(current_prefix_title)
+    window.set_vault_name(current_vault_name)
+    window.set_save_folder(current_save_folder)
 
     hotkey_bridge = GlobalHotkeyBridge()
     hotkey_bridge.activated.connect(window.handle_show_shortcut)
